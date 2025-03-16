@@ -5,6 +5,7 @@ import json
 import os
 import re
 from mistralai import Mistral, DocumentURLChunk
+from mistralai.models import OCRResponse
 from pathlib import Path
 import base64
 from openai import OpenAI
@@ -29,7 +30,7 @@ class GradingState(TypedDict):
 
 # Initialize API clients with environment variables
 mistral_client = Mistral(api_key=os.getenv("MISTRAL_API_KEY"))
-llm = ChatOpenAI(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o")
+llm = ChatOpenAI(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4-turbo")
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Create storage directories
@@ -79,10 +80,10 @@ def generate_reference_solution_multimodal(state: GradingState):
 def generate_reference_solution_reasoning(state: GradingState):
     problem_statement = state['problem_statement']
 
-    prompt = f"Provide a detailed, step-by-step solution to the following problem:\n\n{problem_statement}"
+    prompt = f"Provide a detailed, step-by-step solution to the following problem (Work on each problem separately):\n\n{problem_statement}"
 
     completion = openai_client.chat.completions.create(
-        model="o1",
+        model="o3-mini",
         reasoning_effort="high",
         messages=[
             {
@@ -99,6 +100,22 @@ def generate_reference_solution_reasoning(state: GradingState):
     print(f"Reasoning tokens used: {reasoning_tokens}")
     
     return state
+
+# Helper function for OCR step
+def replace_images_in_markdown(markdown_str: str, images_dict: dict) -> str:
+    for img_name, base64_str in images_dict.items():
+        markdown_str = markdown_str.replace(f"![{img_name}]({img_name})", f"![{img_name}]({base64_str})")
+    return markdown_str
+
+def get_combined_markdown(ocr_response: OCRResponse) -> str:
+  markdowns: list[str] = []
+  for page in ocr_response.pages:
+    image_data = {}
+    for img in page.images:
+      image_data[img.id] = img.image_base64
+    markdowns.append(replace_images_in_markdown(page.markdown, image_data))
+
+  return "\n\n".join(markdowns)
 
 # Step 2: OCR extraction function (with choice of provider)
 def ocr_step(state: GradingState):
@@ -159,10 +176,13 @@ def ocr_step(state: GradingState):
 
             ocr_response = mistral_client.ocr.process(
                 document=DocumentURLChunk(document_url=signed_url.url),
-                model="mistral-ocr-latest"
+                model="mistral-ocr-latest",
+                include_image_base64=True
             )
 
-            structured_text = "\n\n".join(page.markdown for page in ocr_response.pages)
+            #structured_text = "\n\n".join(page.markdown for page in ocr_response.pages)
+            structured_text = get_combined_markdown(ocr_response)
+            print(structured_text)
             print("OCR completed with Mistral OCR")
         except Exception as e:
             print(f"Mistral OCR failed with error: {str(e)}")
@@ -172,7 +192,7 @@ def ocr_step(state: GradingState):
     state['structured_text'] = structured_text
     return state
 
-# Step 3: LLM grading function with improved rubric
+# Step 3: LLM grading function with improved rubric using reasoning model
 def llm_grading_step(state: GradingState):
     structured_text = state['structured_text']
     reference_solution = state['reference_solution']
@@ -186,20 +206,34 @@ def llm_grading_step(state: GradingState):
         f"### Grading Rubric:\n"
         f"1. Problem Attempt:\n"
         f"   - If no attempt then give zero to that sub problem?\n"
-        f"2. Correctness (0-10 points):\n"
+        f"2. Correctness (0-10 points) for each problem :\n"
         f"   - Does the solution correctly solve the problem?\n"
         f"   - Is the solution free of logical errors?\n\n"
         f"Please provide:\n"
-        f"1. A score for each rubric category\n"
+        f"1. A score for each rubric category (for each problem)\n"
         f"2. Justification for each score, citing specific parts of the student's solution. If points are deducted, give detailed comments.\n"
         f"3. A total score out of 10\n"
-        f"4. 1-2 specific areas of improvement for the student\n"
         f"Format your response clearly with markdown headers for each section."
     )
 
-    response = llm.invoke(prompt)
-    state['llm_grading'] = response.content
+    # Use o1 reasoning model instead of standard LLM
+    completion = openai_client.chat.completions.create(
+        model="o3-mini",
+        reasoning_effort="high",
+        messages=[
+            {
+                "role": "user", 
+                "content": prompt
+            }
+        ]
+    )
 
+    state['llm_grading'] = completion.choices[0].message.content
+    
+    # Log the reasoning tokens used
+    reasoning_tokens = completion.usage.completion_tokens_details.reasoning_tokens
+    print(f"Grading reasoning tokens used: {reasoning_tokens}")
+    
     return state
 
 # Step 4: Human-in-the-loop verification
@@ -344,7 +378,8 @@ def main():
     parser.add_argument("--problem_id", type=str, help="Unique identifier for the problem set")
     parser.add_argument("--multimodal", action="store_true", help="Use multimodal LLM for reference solution")
     parser.add_argument("--tex_file", type=str, help="Path to the LaTeX problem statement file")
-    parser.add_argument("--ocr", type=str, choices=["gpt4o", "mistral"], default="mistral", 
+    parser.add_argument("--text_file", type=str, help="Path to the text file containing the problem statement")
+    parser.add_argument("--ocr", type=str, choices=["gpt4o", "mistral"], default="gpt4o", 
                        help="OCR provider to use (gpt4o or mistral)")
     args = parser.parse_args()
     
@@ -364,20 +399,46 @@ def main():
             problem_statement = problem_data["problem_statement"]
             print(f"Loaded problem statement for {problem_id}")
     else:
-        # If a TeX file is provided, extract from it
-        if args.tex_file and os.path.exists(args.tex_file):
+        # Try to get problem statement from a text file first
+        if args.text_file and os.path.exists(args.text_file):
+            try:
+                print(f"Reading problem statement from {args.text_file}...")
+                with open(args.text_file, 'r') as f:
+                    problem_statement = f.read().strip()
+                print("Problem statement loaded from text file.")
+            except Exception as e:
+                print(f"Error reading text file: {str(e)}")
+                problem_statement = None
+        # If not available or failed, try using TeX file
+        elif args.tex_file and os.path.exists(args.tex_file):
             print(f"Extracting problem statement from {args.tex_file}...")
             problem_statement = extract_problem_from_tex(args.tex_file)
             print("Problem statement extracted from TeX file.")
         else:
-            # Otherwise prompt the user for the TeX file path
-            tex_path = input("Enter path to problem statement TeX file (or press Enter to input manually): ")
+            # Otherwise prompt the user for the text file path first
+            text_path = input("Enter path to problem statement text file (or press Enter to try other options): ")
             
-            if tex_path and os.path.exists(tex_path):
-                problem_statement = extract_problem_from_tex(tex_path)
-                print("Problem statement extracted from TeX file.")
+            if text_path and os.path.exists(text_path):
+                try:
+                    print(f"Reading problem statement from {text_path}...")
+                    with open(text_path, 'r') as f:
+                        problem_statement = f.read().strip()
+                    print("Problem statement loaded from text file.")
+                except Exception as e:
+                    print(f"Error reading file: {str(e)}")
+                    problem_statement = None
             else:
-                # Manual input if no TeX file
+                # If text file approach didn't work, try TeX file
+                tex_path = input("Enter path to problem statement TeX file (or press Enter to input manually): ")
+                
+                if tex_path and os.path.exists(tex_path):
+                    problem_statement = extract_problem_from_tex(tex_path)
+                    print("Problem statement extracted from TeX file.")
+                else:
+                    problem_statement = None
+                    
+            # Fall back to manual input if all automated approaches failed
+            if not problem_statement:
                 print("Please provide the problem statement:")
                 problem_statement = input("> ")
                 while not problem_statement.strip():
@@ -428,6 +489,7 @@ def main():
             print(f"Error processing student {student_id}: {str(e)}")
     
     print("\nAll student submissions processed. Exiting.")
+
 
 if __name__ == "__main__":
     main()
